@@ -1,0 +1,550 @@
+#!/usr/bin/env lua
+--globals! cat uppity |luac -p -l - |grep ETGLOBAL
+local arg, print, ipairs, pairs, os, io, next, type, string, table, tostring, assert, dofile, pcall, getmetatable, require, unpack, error  =
+      arg, print, ipairs, pairs, os, io, next, type, string, table, tostring, assert, dofile, pcall, getmetatable, require, unpack, error
+
+pcall(require, "luarocks.require")
+local socket = require "socket"
+local http = require "socket.http"
+local ltn12 = require "ltn12"
+
+local function load_conf(x)
+    local ok, e = pcall(dofile, x)
+    if not ok and not string.match(e, "^cannot open ") then
+        error(e)
+    end
+    return ok
+end
+
+local ok = load_conf('./uppity.conf')
+ok = ok or load_conf('/etc/uppity.conf')
+ok = ok or load_conf(os.getenv('HOME')..'/.uppity.conf')
+ok = ok or load_conf(os.getenv('HOME')..'/.config/uppity.conf')
+
+if not ok then
+    print('Error: no config file found, no services available')
+    os.exit(1)
+end
+
+SERVICES = SERVICES or {}
+
+LP = {}
+LP.services_dir = SERVICES_DIR or ''
+LP.service = DEFAULT_SERVICE or 'codepad'
+LP.language = DEFAULT_LANGUAGE or 'plain'
+LP.expires = DEFAULT_EXPIRY or '1 hour'
+LP.services = {}
+LP.options = {}
+LP.files = {}
+LP.textdata = ''
+LP.description = DEFAULT_DESCRIPTION or ''
+LP.run = RUN or false
+LP.private = PRIVATE or false
+LP.boundary = '##ThIs_iS_ThE_BoUnDaRy##'
+LP.nick = DEFAULT_NICK or os.getenv('USER')
+LP.concat = false
+LP.command = false
+LP.xpaste = false
+LP.xcut = false
+LP.file = 'data from stdin'
+LP.cont = true
+LP.stdin = true
+LP.error_retrieving_url = 'Error retrieving url.'
+
+local function load_services()
+    for i, service in ipairs(SERVICES) do
+        local ok = load_conf('./uppity.d/'..service..'.service.lua')
+        ok = ok or load_conf('/etc/uppity.d/'..service..'.service.lua')
+        ok = ok or load_conf(os.getenv('HOME')..'/.uppity.d/'..service..'.service.lua')
+        ok = ok or load_conf(os.getenv('HOME')..'/.config/uppity.d/'..service..'.service.lua')
+        ok = ok or load_conf(LP.services_dir..'/'..service..'.service.lua')
+        if not ok then
+            print('Error: '..service .. '.service.lua could not be opened')
+            os.exit(1)
+        end
+    end
+end
+
+local function str__mod(lhs, rhs)
+    if type(rhs) == 'table' then
+        return lhs:format(unpack(rhs))
+    end
+
+    return lhs:gsub('%%', '%%%%'):gsub('%%%%', '%%', 1):format(rhs)
+end
+
+getmetatable("").__mod = str__mod
+
+LP.create_form_body = function(body_tbl)
+    local body = {}
+    local tblinsert = table.insert
+    for name, info in pairs(body_tbl) do
+        tblinsert(body, '--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s'
+            % {LP.boundary, name,  info})
+    end
+    tblinsert(body,'--'..LP.boundary..'--')
+    tblinsert(body, '')
+    return table.concat(body, '\r\n')
+end
+
+local function fdata(file)
+    if file:match('^~') then
+        file = file:gsub('^~', os.getenv('HOME'))
+    end
+    local fd = assert(io.open(file, "rb"))
+    local buf = fd:read("*a")
+    fd:close()
+    LP.textdata = buf
+end
+
+local function fdata_concat()
+  local fd
+  local buf = ""
+  for k, file in pairs(LP.files) do
+    fd = assert(io.open(file, "rb"))
+    buf = buf .. file .. "\n" .. fd:read("*a")
+    fd:close()
+  end
+  LP.textdata = buf
+end
+
+LP.add_service = function(service_name, service_url, languages_tbl, body_func, post_func, url_matcher, expires_tbl)
+    LP.services[service_name] = {
+        url = service_url,
+        languages = languages_tbl,
+        body = body_func,
+        post_func = post_func,
+        matcher = url_matcher,
+        expires = expires_tbl or {}
+    }
+end
+
+local function get_service_value(sub_tbl_name, key)
+    return LP.services[LP.service][sub_tbl_name][key]
+end
+
+LP.get_language = function()
+    return get_service_value('languages', LP.language) or LP.language
+end
+
+LP.get_expires = function()
+    return get_service_value('expires', LP.expires) or LP.expires
+end
+
+LP.default_post_method = function(filename)
+    local service = LP.services[LP.service]
+    local body = service.body()
+    local head = {
+        ['content-type'] = 'multipart/form-data; boundary=%s' % LP.boundary;
+        ['content-length'] = tostring(#body);
+        ['accept'] = 'text/*';
+    }
+
+    local response = {}
+    local source = ltn12.source.string(body)
+    local sent = 0
+    local function progress()
+        local data = source()
+        sent = sent + #(data or "")
+        local progress = sent/#body * 100
+        io.stdout:write("\rUploading %s: %d%" % filename % progress)
+        return data
+    end
+
+    local r, e,h = http.request({
+        method = 'POST';
+        url = service.url;
+        headers = head;
+        source = progress;
+        sink = ltn12.sink.table(response);
+    })
+    print()
+
+    if not r then
+        return nil, tostring(e)
+    end
+
+    response = table.concat(response)
+    local err = response:match('<err%s+type="(.*)"/>')
+    if err then
+        return nil, err
+    end
+
+    return service.matcher(response, h)
+end
+
+local function submit()
+    local returned_urls = {}
+    local post_method = LP.services[LP.service].post_func
+    if DEFAULT_DESCRIPTION == LP.description then
+        --description flag used, leave it alone
+    else
+        LP.description = LP.file
+    end
+    if LP.concat and #LP.files > 0 and LP.stdin ~= true then
+        fdata_concat()
+        table.insert(returned_urls, post_method(LP.file))
+    elseif #LP.files > 0 and LP.stdin ~= true then
+        for k, v in ipairs(LP.files) do
+            fdata(v)
+            table.insert(returned_urls, post_method(v))
+        end
+--    elseif #arg == 0 or #LP.files == 0 and LP.stdin == true then
+    elseif LP.stdin == true then
+        LP.textdata = io.stdin:read('*a')
+        table.insert(returned_urls, post_method(LP.file))
+    elseif LP.stdin ~= true and #LP.files == 0 and (LP.command or LP.xcut) then
+        table.insert(returned_urls, post_method(LP.file))
+    end
+    if LP.xpaste then
+        os.execute('echo ' .. table.concat(returned_urls, ' ') .. ' | xclip -i >&/dev/null')
+    end
+    for i, url in ipairs(returned_urls) do
+        print(url)
+    end
+end
+
+local function add_option(required_opt, option_name, func_name, secondary_name)
+    LP.options[option_name] = {on = false, params = {}, func = func_name, required = required_opt}
+    if secondary_name and secondary_name ~= option_name then
+        LP.options[secondary_name] = {on = false, params = LP.options[option_name].params, func = func_name, required = required_opt}
+    end
+end
+
+local function get_options()
+    local tblinsert = table.insert
+    local function reset_flags()
+        for k in pairs(LP.options) do
+            LP.options[k].on = false
+        end
+    end
+    local cur_opt, required_opt, s
+    for i = 1, #arg do
+        if string.match(arg[i], "^%-%-") then
+            s = string.gsub(arg[i], "^%-%-", "")
+            if LP.options[s] and #s > 1 then
+                LP.options[s].on = true
+                cur_opt = s
+                required_opt = LP.options[s].required
+            else
+                print("--"..s.." is an invalid option")
+                reset_flags()
+            end
+
+        elseif string.match(arg[i], "^%-%a+") then
+            for j = 1, #arg[i]-1 do
+                s = string.sub(arg[i], j+1, j+1)
+                if LP.options[s] then
+                    LP.options[s].on = true
+                    cur_opt = s
+                    required_opt = LP.options[s].required
+                else
+                    print("-"..s.." is an invalid option")
+                    reset_flags()
+                end
+            end
+
+        elseif cur_opt then
+            if required_opt then
+                tblinsert(LP.options[cur_opt].params, arg[i])
+                cur_opt = nil
+                required_opt = false
+            else
+                tblinsert(LP.options["f"].params, arg[i])
+                LP.stdin = false
+                LP.options["f"].on = true
+            end
+        else
+            tblinsert(LP.options["f"].params, arg[i])
+            LP.stdin = false
+            LP.options["f"].on = true
+        end
+    end
+end
+
+local function file_list(params)
+    if #params > 0 then
+        for k, v in ipairs(params) do
+            table.insert(LP.files, v)
+        end
+        return
+    end
+    print("Usage: uppity -f foo bar baz ...")
+    LP.cont = false
+end
+
+add_option(true, "f", file_list, "file")
+
+local function pick_service(params)
+    if params[1] then
+        LP.service = params[1]
+        return
+    end
+    print("Usage: uppity -s SERVICE")
+    LP.cont = false
+end
+
+add_option(true, "s", pick_service, "service")
+
+local function pick_language(params)
+    if params[1] then
+        LP.language = params[1]
+        return
+    end
+    print("Usage: uppity -l LANGUAGE")
+    LP.cont = false
+end
+
+add_option(true, "l", pick_language, "language")
+
+local function private()
+    LP.private = true
+end
+
+add_option(false, "p", private, "private")
+
+local function run()
+    LP.run = true
+end
+
+add_option(false, "r", run, "run")
+
+local function concat()
+    LP.file = 'Multiple files'
+    LP.concat = true
+end
+
+add_option(false, "c", concat, "concat")
+
+local function description(params)
+    if params[1] then
+        LP.description = params[1]
+        DEFAULT_DESCRIPTION = params[1]
+        return
+    end
+    print("Usage: uppity -d DESCRIPTION")
+    LP.cont = false
+end
+
+add_option(true, "d", description, "description")
+
+local function nick(params)
+    if params[1] then
+        LP.nick = params[1]
+        return
+    end
+    print("Usage: uppity -n NICK")
+    LP.cont = false
+end
+
+add_option(true, "n", nick, "nick")
+
+local function list_services()
+    for k in pairs(LP.services) do
+        print(k)
+    end
+    LP.cont = false
+end
+
+add_option(false, "S", list_services, "list-services")
+
+local function list_languages(params)
+    LP.cont = false
+    if LP.services[params[1]] then
+        for k, v in pairs(LP.services[params[1]].languages) do
+            if type(k) == "number" then
+                print(v)
+            else
+                print(k)
+            end
+        end
+        return
+    end
+    print("Usage: uppity -L SERVICE")
+end
+
+add_option(true, "L", list_languages, "list-languages")
+
+local function set_expiry(params)
+    if params[1] then
+        LP.expires = params[1]
+        return
+    end
+    print("Usage: uppity -e EXPIRATION")
+    LP.cont = false
+end
+
+add_option(true, "e", set_expiry, "expiration")
+
+local function list_expiry(params)
+    if LP.services[params[1]] then
+        for k, v in pairs(LP.services[params[1]].expires) do
+            if type(k) == "number" then
+                print(v)
+            else
+                print(k)
+            end
+        end
+        return
+    end
+    print("Usage: uppity -E SERVICE")
+    LP.cont = false
+end
+
+add_option(true, "E", list_expiry, "list-expiration")
+
+local function check_xclip()
+    local x = os.execute('which xclip >&/dev/null')
+    if x == 0 then
+        return true
+    end
+    return false
+end
+
+local function xcut()
+    if check_xclip() then
+        local fd = io.popen("xclip -o")
+        LP.textdata = fd:read("*a")
+        fd:close()
+        LP.file = "X clipboard selection"
+        LP.xcut = true
+        return
+    end
+    print("xclip must be installed to use this option.")
+    LP.cont = false
+end
+
+add_option(false, "x", xcut, "xcut")
+
+local function xpaste()
+    if check_xclip() then
+        LP.xpaste = true
+        return
+    end
+    print("xclip must be installed to use this option.")
+    LP.cont = false
+end
+
+add_option(false, "X", xpaste, "xpaste")
+
+local function help()
+print([=[
+Usage: uppity [options] [file[s]]
+
+Options:
+    -f, --file FILE(s)              list of files to upload
+    -s, --service "SERVICE"         set service to use
+    -l, --language "LANG"           set what language to use
+    -e, --expiration "EXPIRATION"   set when to expire (defaults to 1 day)
+    -C, --command "COMMAND"         run COMMAND and paste the output
+    -p, --private                   set private flag if available
+    -r, --run                       set run flag (codepad, ideone)
+    -c, --concat                    concat multiple files into a single upload
+                                    default is a separate paste for each file
+    -x, --xcut                      read input from clipboard (requires xclip)
+    -X, --xpaste                    write url to X primary selection buffer (requires xclip)
+    -d, --description "DESC"        set description of paste
+    -n, --nick "NICK"               set the name to use for a paste
+    -h, --help                      show this help info
+
+    -E, --list-expiration "SERVICE" list supported expiration times for a service
+    -S, --list-services             list supported services
+    -L, --list-languages "SERVICE"  list supported languages for a service
+]=])
+    LP.cont = false
+end
+
+add_option(false, "h", help, "help")
+
+local function run_command(params)
+    if params[1] then
+        local fd = assert(io.popen(params[1]))
+        LP.textdata = fd:read('*a')
+        fd:close()
+        LP.file = params[1]
+        LP.command = true
+	LP.stdin = false
+        return
+    end
+    print("Usage: -C COMMAND")
+    LP.cont = false
+end
+
+add_option(true, "C", run_command, "command")
+
+local function set_options()
+    for k in pairs(LP.options) do
+        if LP.options[k].on == true then
+            LP.options[k].func(LP.options[k].params)
+        end
+    end
+end
+
+local function check_service()
+    if not LP.services[LP.service] then
+        print("Invalid service.")
+        LP.cont = false
+    end
+end
+
+local function check_language()
+    if not (function()
+        for k, v in pairs(LP.services[LP.service].languages) do
+            if type(k) == "number" then
+                if v:lower() == LP.language:lower() then
+                    LP.language = v
+                    return true
+                end
+            elseif k:lower() == LP.language:lower() then
+                LP.language = k
+                return true
+            end
+        end
+    end)()
+    then
+        LP.cont = false
+        print('Invalid language.')
+    end
+end
+
+local function check_expiry()
+    if next(LP.services[LP.service].expires) then
+        if not (function()
+            for k, v in pairs(LP.services[LP.service].expires) do
+                if type(k) == "number" then
+                    if v:lower() == LP.expires:lower() then
+                        LP.expires = v
+                        return true
+                    end
+                elseif k:lower() == LP.expires:lower() then
+                    LP.expires = k
+                    return true
+                end
+            end
+        end)()
+        then
+            LP.cont = false
+            print("Invalid expiration.")
+        end
+    end
+end
+
+load_services(LP.services_dir)
+
+get_options()
+set_options()
+check_service()
+
+local function exit_on_failure()
+    if not LP.cont then
+        os.exit(1)
+    end
+end
+
+exit_on_failure()
+check_language()
+exit_on_failure()
+check_expiry()
+exit_on_failure()
+submit()
+
